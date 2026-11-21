@@ -38,8 +38,32 @@ def intercept(me, target, velocity, speed, delay=0.0):
         if r>0: t=r
     return (target[0]+vx*(t+delay),target[1]+vy*(t+delay),target[2]+vz*(t+delay))
 
+def mortar_solution(me, target, vel, speed, gravity):
+    """Low ballistic arc to a constant-velocity target; None if out of range.
+
+    Returns (yaw, pitch, predicted_target). World geometry is NOT checked.
+    """
+    dt=math.hypot(target[0]-me[0],target[1]-me[1])/max(1.,speed*.8)
+    for _ in range(4):
+        p=(target[0]+vel[0]*dt,target[1]+vel[1]*dt,target[2]+vel[2]*dt)
+        flat=max(0.1,math.hypot(p[0]-me[0],p[1]-me[1]))
+        height=p[2]-me[2]
+        disc=speed**4-gravity*(gravity*flat**2+2*height*speed**2)
+        if disc<0:
+            return None
+        pitch=math.atan2(speed*speed-math.sqrt(disc),gravity*flat)
+        flight=flat/(max(.2,math.cos(pitch))*speed)
+        dt=.5*dt+.5*flight
+    p=(target[0]+vel[0]*dt,target[1]+vel[1]*dt,target[2]+vel[2]*dt)
+    flat=max(.1,math.hypot(p[0]-me[0],p[1]-me[1]))
+    height=p[2]-me[2]
+    disc=speed**4-gravity*(gravity*flat**2+2*height*speed**2)
+    if disc<0: return None
+    pitch=math.atan2(speed*speed-math.sqrt(disc),gravity*flat)
+    return math.atan2(p[1]-me[1],p[0]-me[0]),pitch,p
+
 class Bot:
-    name = 'Survivor-v4'
+    name = 'Survivor-v8'
 
     def __init__(self, hello):
         self.config=hello['config']
@@ -213,9 +237,9 @@ class Bot:
                 if not w: continue
                 kind=w['kind']; stats=w['stats']; cd=w.get('cooldown',0)
                 if kind=='gun' and d<min(stats.get('range',230),220): priority.append((2.0,i,kind))
-                elif kind=='laser' and d<stats.get('range',280): priority.append((4.0,i,kind))
-                elif kind=='lightning' and d<stats.get('range',45)*.91: priority.append((3.8,i,kind))
-                elif kind=='mortar' and 28<d<150: priority.append((2.5,i,kind))
+                elif kind=='laser' and d<stats.get('range',280) and (cd<0.11 or w.get('charge',0)>0): priority.append((4.0,i,kind))
+                elif kind=='lightning' and d<stats.get('range',45)*.91 and cd<0.11: priority.append((3.8,i,kind))
+                elif kind=='mortar' and 28<d<150 and cd<0.11: priority.append((2.5,i,kind))
             if priority:
                 _,slot,kind=max(priority)
                 weapon=weapons[slot]; stats=weapon['stats']
@@ -226,30 +250,37 @@ class Bot:
                 elif kind=='laser':
                     predicted=(tp[0]+v[0]*.08,tp[1]+v[1]*.08,aim_z+v[2]*.08)
                 elif kind=='mortar':
-                    travel=d/max(stats.get('speed',72)*.78,1)
-                    predicted=(tp[0]+v[0]*travel,tp[1]+v[1]*travel,aim_z+v[2]*travel)
+                    predicted=(tp[0],tp[1],aim_z)
                 else:predicted=(tp[0],tp[1],aim_z)
                 aim_yaw=direction(pos,predicted)
                 flat=max(1.,distance(pos,predicted))
                 height=predicted[2]-muzzle[2]
                 aim_pitch=math.atan2(height,flat)
+                mortar_valid=True
                 if kind=='mortar':
-                    speed=stats.get('speed',72); gravity=self.config['weapons']['mortar'].get('gravity',22)
-                    radicand=speed**4-gravity*(gravity*flat**2+2*height*speed**2)
-                    if radicand>=0:
-                        aim_pitch=math.atan((speed*speed-math.sqrt(radicand))/(gravity*flat))
+                    # Mortar has a different launch height and gravitational drop.
+                    tube=[x,y,z+me['stats'].get('height',9)+0.5]
+                    sol=mortar_solution(tube,[tp[0],tp[1],aim_z],v,
+                        stats.get('speed',72),self.config['weapons']['mortar'].get('gravity',22))
+                    mortar_valid=(sol is not None)
+                    if sol is not None: aim_yaw,aim_pitch,predicted=sol
                 yaw_error=abs(angle_diff(aim_yaw,me['aim'][0]))
                 pitch_error=abs(aim_pitch-me['aim'][1])
                 aligned=yaw_error<max(.04,math.atan2(3.,max(15.,d))) and pitch_error<.15
                 if kind=='laser':
                     charge=weapon.get('charge',0)
                     fire[slot]=charge<stats.get('charge',.75)-.05 or not aligned
-                elif kind=='lightning':fire[slot]=aligned and energy>12
-                elif kind=='mortar':fire[slot]=aligned and d>30
+                elif kind=='lightning':
+                    # A 30-degree *cone* does not need single-bullet precision.
+                    cone=math.radians(stats.get('cone_deg',30))*0.5
+                    fire[slot]=(energy>stats.get('energy',3)+5 and
+                        yaw_error<min(.17,cone-.035) and pitch_error<.25)
+                elif kind=='mortar':fire[slot]=mortar_valid and aligned and d>30
                 else:fire[slot]=aligned and weapon.get('ammo',1)>0
-                # Gun is independent and can be fired alongside special weapons.
+                # Concurrent gun fire is useful with direct-aim lasers/lightning,
+                # but firing a gun along a high mortar arc just wastes ammunition.
                 for i,w in enumerate(weapons):
-                    if i!=slot and w and w['kind']=='gun' and d<200 and aligned:
+                    if i!=slot and w and w['kind']=='gun' and kind!='mortar' and d<200 and aligned:
                         fire[i]=w.get('ammo',1)>0
         else:
             # Rotate vision when no enemies are visible.
@@ -263,6 +294,8 @@ class Bot:
                 if not target and charge>0.12:
                     fire[i]=False
         action['fire']=fire
+        # Keep v4 reload policy unchanged: our surrogate ablation did not show
+        # a survival benefit from changing it. Test ammo optimization separately.
         if any(w and w['kind']=='gun' and w.get('ammo',0)<=2 and w.get('reload',0)<=0 for w in weapons):
             action['reload']=True
         return action
