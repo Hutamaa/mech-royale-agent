@@ -1,6 +1,8 @@
 """Survival-oriented Mech Royale bot v1. Standard library only."""
 import math
 import random
+import json
+import os
 import mechfight as mf
 
 PI = math.pi
@@ -38,8 +40,68 @@ def intercept(me, target, velocity, speed, delay=0.0):
         if r>0: t=r
     return (target[0]+vx*(t+delay),target[1]+vy*(t+delay),target[2]+vz*(t+delay))
 
+def point_in_poly(x, y, ring):
+    inside = False
+    j = len(ring) // 2 - 1
+    for i in range(len(ring)//2):
+        xi, yi = ring[2*i], ring[2*i+1]
+        xj, yj = ring[2*j], ring[2*j+1]
+        if ((yi > y) != (yj > y)) and x < (xj-xi)*(y-yi)/(yj-yi+1e-12)+xi:
+            inside = not inside
+        j=i
+    return inside
+
+
+def seg_dist(x, y, ax, ay, bx, by):
+    vx,vy=bx-ax,by-ay
+    t=max(0.,min(1.,((x-ax)*vx+(y-ay)*vy)/(vx*vx+vy*vy+1e-9)))
+    return math.hypot(x-ax-t*vx,y-ay-t*vy)
+
+
+def blockers_near(prisms, x, y, z, radius=45):
+    res=[]
+    for b in prisms:
+        if b[4] < x-radius or b[3] > x+radius or b[6] < y-radius or b[5] > y+radius:
+            continue
+        if b[1] <= z+1.2 or b[0] >= z+9:
+            continue
+        res.append(b[2])
+    return res
+
+
+def clear_segment(x,y,tx,ty,rings, clearance=4.0):
+    d=math.hypot(tx-x,ty-y)
+    if d<1e-3: return True
+    # Sample the expected travel line; the mech radius is about 2.5 m.
+    count=max(2,int(d/3)+1)
+    for i in range(1,count+1):
+        a=i/count
+        px=x+(tx-x)*a; py=y+(ty-y)*a
+        for ring in rings:
+            if point_in_poly(px,py,ring):return False
+            for j in range(0,len(ring),2):
+                k=(j+2)%len(ring)
+                if seg_dist(px,py,ring[j],ring[j+1],ring[k],ring[k+1])<clearance:
+                    return False
+    return True
+
+
+def navigated_direction(x,y,tx,ty,prisms,z,desired=None):
+    dx,dy=norm(tx-x,ty-y)
+    if desired is not None: dx,dy=norm(*desired)
+    if dx==0 and dy==0:return (0.,0.)
+    rings=blockers_near(prisms,x,y,z)
+    if not rings or clear_segment(x,y,x+dx*13,y+dy*13,rings):return dx,dy
+    # Rotational candidate planning rather than pushing forever into a wall.
+    angle=math.atan2(dy,dx)
+    for delta in (0.28,-0.28,0.55,-0.55,0.85,-0.85,1.2,-1.2,1.55,-1.55,2.05,-2.05,2.6,-2.6,3.14):
+        a=angle+delta; vx,vy=math.cos(a),math.sin(a)
+        if clear_segment(x,y,x+vx*11,y+vy*11,rings):return vx,vy
+    return -dx,-dy
+
+
 class Bot:
-    name = 'Survivor-v2'
+    name = 'Survivor-v3'
 
     def __init__(self, hello):
         self.config=hello['config']
@@ -53,6 +115,16 @@ class Bot:
         self.strafe_sign=1 if self.rng.random()<0.5 else -1
         self.laser_held=False
         self.target_id=None
+        self.prisms=[]
+        self.heal_until=-100
+        try:
+            path=os.path.join(hello['map']['dir'],'v2','world.json')
+            world=json.load(open(path))
+            for p in world.get('prisms',[]):
+                ring=p['ring']; xs=ring[::2]; ys=ring[1::2]
+                self.prisms.append((p['base'],p['top'],ring,min(xs),max(xs),min(ys),max(ys)))
+        except (OSError, ValueError, KeyError):
+            pass  # Local protocol replay may not have a mounted map.
 
     def act(self, obs):
         me=obs['self']; pos=me['pos']; x,y,z=pos
@@ -69,8 +141,14 @@ class Bot:
         dist_current=distance(pos,center)
         zone_urgent=(not me['in_zone'] or dist_current>current_radius-25 or
             (remaining < max(15.0, (dist_next-safe_radius)/max(7.,me['stats'].get('walk_speed',11.7))+12)))
-        # Prefer a location close to the next center if threatened by shrinking zone.
-        tx,ty=(next_center[0],next_center[1])
+        # Stay at a defensible location; moving straight to the center invites focus fire.
+        # Only reposition if unsafe for the next shrink.
+        if dist_next > safe_radius-16:
+            vx,vy=norm(next_center[0]-x,next_center[1]-y)
+            tx,ty=x+vx*max(30.,dist_next-safe_radius+25),y+vy*max(30.,dist_next-safe_radius+25)
+        else:
+            tx,ty=x,y
+
         action={'tick':obs['tick']}
         if obs.get('offer'):
             choices=obs['offer']['choices']
@@ -102,13 +180,19 @@ class Bot:
         close_enemies=[(e,distance(pos,e['pos'])) for e in enemies]
         nearest_enemy=min((d for _,d in close_enemies),default=1e6)
         endangered=nearest_enemy<65 or any(ev['type']=='damaged' for ev in obs.get('events',[]))
+        # A damaged mech can regenerate 45 HP/s after 5 seconds out of combat.
+        # Avoid both dealing and receiving damage long enough for regen to activate.
+        if hp < maxhp*.72 and not zone_urgent:
+            self.heal_until=max(self.heal_until,t+6.5) if t-self.last_damage_time<1 else self.heal_until
+        healing=(t<self.heal_until and hp<maxhp*.94 and not zone_urgent)
+
         if any(ev['type']=='damaged' for ev in obs.get('events',[])):
             self.last_damage_time=t
         if best_pickup:
             _,p,d=best_pickup
             if d<self.config['loot']['pickup_radius'] and (None in weapons):
                 action['take']=p['id']
-            if d<60 and not zone_urgent and not endangered and (None in weapons):
+            if d<60 and not zone_urgent and not endangered and not healing and (None in weapons):
                 tx,ty=p['pos'][:2]
         # Prefer cubes directly accessible (valuable scaling).
         cubes=[]
@@ -116,7 +200,7 @@ class Bot:
             d=distance(pos,cube['pos'])
             if abs(cube['pos'][2]-z)<5:
                 cubes.append((d,cube))
-        if cubes and not zone_urgent and nearest_enemy>45:
+        if cubes and not zone_urgent and not healing and nearest_enemy>45:
             d,cube=min(cubes,key=lambda q:q[0])
             if d<65: tx,ty=cube['pos'][:2]
 
@@ -127,7 +211,7 @@ class Bot:
             time_to_land=max(0,drop['lands_in'])
             travel_time=dd/max(6.0,me['stats'].get('walk_speed',11.7))
             potential=(hp < maxhp*.65 or me['cubes']<5 or energy<30)
-            if (potential and not zone_urgent and nearest_enemy>75 and
+            if (potential and not zone_urgent and not healing and nearest_enemy>75 and
                 dd<100 and travel_time<time_to_land+18 and
                 distance(drop['pos'],next_center)<safe_radius):
                 tx,ty=drop['pos'][:2]
@@ -137,12 +221,14 @@ class Bot:
         nearest=min(enemies,key=lambda e:distance(pos,e['pos']),default=None)
         if nearest and not zone_urgent:
             d=distance(pos,nearest['pos'])
-            if d<70:
+            if d<(135 if healing else 95):
                 ex,ey=nearest['pos'][:2]
                 away=norm(x-ex,y-ey)
                 tangent=(-away[1]*self.strafe_sign,away[0]*self.strafe_sign)
-                if d<35: tx,ty=x+away[0]*80+tangent[0]*20,y+away[1]*80+tangent[1]*20
-                else: tx,ty=x+tangent[0]*80+away[0]*30,y+tangent[1]*80+away[1]*30
+                if healing or d<48:
+                    tx,ty=x+away[0]*110+tangent[0]*25,y+away[1]*110+tangent[1]*25
+                else:
+                    tx,ty=x+tangent[0]*85+away[0]*30,y+tangent[1]*85+away[1]*30
         if obs['tick']%100==0: self.strafe_sign*=-1
 
         # Zone-safe steering: do not step beyond the next circle while kiting.
@@ -165,6 +251,7 @@ class Bot:
                 scale=(13-miss)/13
                 dodge_x+=dx*scale; dodge_y+=dy*scale
         ux,uy=norm(ux+dodge_x*2.2,uy+dodge_y*2.2)
+        ux,uy=navigated_direction(x,y,tx,ty,self.prisms,z,(ux,uy))
         if self.prev_pos is not None and math.hypot(x-self.prev_pos[0],y-self.prev_pos[1])<.15 and math.hypot(ux,uy)>.5:
             self.stuck_ticks+=1
         else:self.stuck_ticks=max(0,self.stuck_ticks-2)
@@ -174,7 +261,7 @@ class Bot:
         action['move']=[ux,uy]
         # Boost is precious for jetting across obstacles and escaping immediate danger.
         # Don't boost continuously in the air: it prevents energy regeneration.
-        action['boost']=(not me['grounded'] and energy>65 and self.stuck_ticks>10) or (zone_urgent and energy>40 and dist_next>40 and me['grounded'])
+        action['boost']=(not me['grounded'] and energy>65 and self.stuck_ticks>10) or (zone_urgent and energy>40 and dist_next>40 and me['grounded']) or (healing and nearest_enemy<70 and me['grounded'] and energy>55)
         action['jump']=bool(me['grounded'] and self.stuck_ticks>20 and obs['tick']%16==0)
 
         # Target selection: mostly fire on mechs; only farm NPCs/crates when safe.
@@ -182,7 +269,7 @@ class Bot:
         # Farming nearby crates/drones is viable when no mech is an immediate threat.
         # A cube grants permanent combat scaling; don't shoot distant enemies all game.
         farming=[]
-        if not endangered and nearest_enemy>90 and not zone_urgent:
+        if not endangered and nearest_enemy>90 and not zone_urgent and not healing:
             farming += [(distance(pos,e['pos'])+20,e,False) for e in npcs if distance(pos,e['pos'])<95]
             farming += [(distance(pos,c['pos'])+32,c,True) for c in obs['crates'] if distance(pos,c['pos'])<115]
         if farming:
@@ -202,7 +289,7 @@ class Bot:
         aim_yaw=math.atan2(next_center[1]-y,next_center[0]-x)
         aim_pitch=0.0
         fire=[False,False]
-        if target:
+        if target and not healing:
             tp=target['pos']; d=distance(pos,tp)
             aim_z=tp[2]+(1.6 if target.get('kind')=='npc' else 4.5)
             if target_is_crate: aim_z=tp[2]+2
